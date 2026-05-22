@@ -1,0 +1,303 @@
+---
+- name: Deploy Asterisk from source on Rocky 8 server
+  hosts: asterisk_servers
+  become: yes
+
+  vars:
+    asterisk_version: "22.5.1"
+    asterisk_tar: "asterisk-{{ asterisk_version }}.tar.gz"
+    asterisk_url: "http://downloads.asterisk.org/pub/telephony/asterisk/old-releases/{{ asterisk_tar }}"
+    asterisk_source_dir: "/usr/src/asterisk-{{ asterisk_version }}"
+
+    # ВНИМАНИЕ: используем правильное имя переменной!
+    pjsip_users:
+      - { name: "201", secret: "StrongPass123", callerid: "Sample" }
+      - { name: "202", secret: "StrongPass456", callerid: "Sample2" }
+      - { name: "203", secret: "SecurePass789", callerid: "Sample3" }
+
+  tasks:
+    # ============================================
+    # ПРОВЕРКА: установлен ли уже Asterisk
+    # ============================================
+    - name: "Check if Asterisk is already installed"
+      command: which asterisk
+      register: asterisk_installed
+      changed_when: false
+      failed_when: false
+      ignore_errors: yes
+
+    - name: "Skip installation if Asterisk already exists"
+      debug:
+        msg: "Asterisk already installed, skipping build phase..."
+      when: asterisk_installed.rc == 0
+
+    # ============================================
+    # ВСЕ ЗАДАЧИ ПО УСТАНОВКЕ ОБЕРНУТЫ В BLOCK С УСЛОВИЕМ
+    # ============================================
+    - block:
+        - name: "00 - Check for conflicting CentOS 7 repos"
+          shell: |
+            yum repolist 2>&1 | grep -i "centos.*7" && echo "FOUND" || echo "CLEAN"
+          register: centos7_check
+          changed_when: false
+
+        - name: "00a - Disable conflicting CentOS 7 repositories"
+          shell: |
+            find /etc/yum.repos.d/ -name "*.repo" -exec sed -i 's/^\(\[.*centos.*7.*\]\)/\1\ndisable=1/' {} \;
+            dnf clean all
+          when: centos7_check.stdout == "FOUND"
+          ignore_errors: yes
+
+        - name: "01 - Install minimal prerequisites"
+          dnf:
+            name:
+              - wget
+              - tar
+              - gcc
+              - make
+              - curl
+              - file
+              - git
+              - which
+              - libxml2-devel
+              - openssl-devel
+            state: present
+
+        - name: "02 - Download Asterisk source"
+          get_url:
+            url: "{{ asterisk_url }}"
+            dest: "/usr/src/{{ asterisk_tar }}"
+            timeout: 300
+          register: download_result
+          retries: 3
+          delay: 10
+
+        - name: "03 - Extract Asterisk source"
+          unarchive:
+            src: "/usr/src/{{ asterisk_tar }}"
+            dest: "/usr/src/"
+            remote_src: yes
+            creates: "{{ asterisk_source_dir }}"
+
+        - name: "04 - Make install_prereq script executable"
+          file:
+            path: "{{ asterisk_source_dir }}/contrib/scripts/install_prereq"
+            mode: '0755'
+
+        - name: "05 - Run install_prereq"
+          command: "{{ asterisk_source_dir }}/contrib/scripts/install_prereq install"
+          register: prereq_result
+          changed_when: false
+          async: 1800
+          poll: 30
+          ignore_errors: yes
+
+        - name: "06 - Run configure"
+          command: |
+            ./configure \
+              --prefix=/usr \
+              --sysconfdir=/etc \
+              --localstatedir=/var \
+              --libdir=/usr/lib64 \
+              --with-pjproject-bundled
+          args:
+            chdir: "{{ asterisk_source_dir }}"
+            creates: "{{ asterisk_source_dir }}/Makefile"
+          async: 600
+          poll: 30
+
+        - name: "07 - Create menuselect.makeopts"
+          command: make menuselect.makeopts
+          args:
+            chdir: "{{ asterisk_source_dir }}"
+            creates: "{{ asterisk_source_dir }}/menuselect.makeopts"
+
+        - name: "08 - Disable sound files (faster build)"
+          command: |
+            menuselect/menuselect \
+              --disable-category MENUSELECT_CORE_SOUNDS \
+              --disable-category MENUSELECT_EXTRA_SOUNDS \
+              --disable-category MENUSELECT_MOH
+          args:
+            chdir: "{{ asterisk_source_dir }}"
+          ignore_errors: yes
+
+        - name: "09 - Enable PJSIP"
+          command: |
+            menuselect/menuselect --enable chan_pjsip
+          args:
+            chdir: "{{ asterisk_source_dir }}"
+          ignore_errors: yes
+
+        - name: "10 - Compile Asterisk (make) - this takes ~15-20 minutes"
+          make:
+            chdir: "{{ asterisk_source_dir }}"
+            target: all
+          async: 3600
+          poll: 60
+
+        - name: "11 - Install Asterisk (make install)"
+          make:
+            chdir: "{{ asterisk_source_dir }}"
+            target: install
+
+        - name: "12 - Install basic configs (make config)"
+          make:
+            chdir: "{{ asterisk_source_dir }}"
+            target: config
+
+        - name: "13 - Create asterisk group"
+          group:
+            name: asterisk
+            state: present
+            system: yes
+
+        - name: "14 - Create asterisk user"
+          user:
+            name: asterisk
+            group: asterisk
+            shell: /sbin/nologin
+            system: yes
+            state: present
+
+        - name: "15 - Create asterisk directories"
+          file:
+            path: "{{ item }}"
+            state: directory
+            owner: asterisk
+            group: asterisk
+            mode: '0755'
+          loop:
+            - /var/spool/asterisk
+            - /var/log/asterisk
+            - /etc/asterisk
+            - /var/run/asterisk
+            - /var/lib/asterisk
+            - /var/lib/asterisk/sounds
+            - /var/lib/asterisk/moh
+            - /var/lib/asterisk/keys
+
+        - name: "16 - Set ownership for asterisk directories"
+          shell: |
+            chown -R asterisk:asterisk /var/spool/asterisk /var/log/asterisk /etc/asterisk /var/run/asterisk /var/lib/asterisk
+          ignore_errors: yes
+
+        - name: "17 - Create systemd service file for Asterisk"
+          copy:
+            dest: /etc/systemd/system/asterisk.service
+            mode: '0644'
+            content: |
+              [Unit]
+              Description=Asterisk PBX and telephony daemon
+              After=network.target
+
+              [Service]
+              Type=simple
+              User=asterisk
+              Group=asterisk
+              ExecStart=/usr/sbin/asterisk -f -U asterisk -G asterisk -vvv
+              ExecReload=/usr/sbin/asterisk -rx 'core reload'
+              Restart=on-failure
+              LimitNOFILE=65536
+
+              [Install]
+              WantedBy=multi-user.target
+          register: systemd_file
+
+        - name: "18 - Reload systemd daemon"
+          systemd:
+            daemon_reload: yes
+
+      when: asterisk_installed.rc != 0  # Запускаем блок ТОЛЬКО если Asterisk НЕ установлен
+
+    # ============================================
+    # КОНФИГУРАЦИИ (запускаются ВСЕГДА)
+    # ============================================
+    - name: "19 - Backup original configs"
+      command: mv /etc/asterisk/{{ item }} /etc/asterisk/{{ item }}.orig
+      loop:
+        - pjsip.conf
+        - extensions.conf
+      args:
+        removes: /etc/asterisk/{{ item }}
+      ignore_errors: yes
+      notify: reload asterisk
+
+    - name: "20 - Deploy pjsip.conf"
+      template:
+        src: templates/pjsip.conf.j2
+        dest: /etc/asterisk/pjsip.conf
+        owner: asterisk
+        group: asterisk
+        mode: '0640'
+      notify: reload asterisk
+
+    - name: "21 - Deploy extensions.conf"
+      template:
+        src: templates/extensions.conf.j2
+        dest: /etc/asterisk/extensions.conf
+        owner: asterisk
+        group: asterisk
+        mode: '0640'
+      notify: reload asterisk
+
+    - name: "22 - Create basic modules.conf"
+      copy:
+        dest: /etc/asterisk/modules.conf
+        owner: asterisk
+        group: asterisk
+        mode: '0640'
+        content: |
+          [modules]
+          autoload=yes
+          ; PJSIP modules
+          load => res_pjsip.so
+          load => res_pjsip_endpoint_identifier_ip.so
+          load => res_pjsip_registrar.so
+          load => chan_pjsip.so
+          ; Dialplan
+          load => pbx_config.so
+          load => pbx_loopback.so
+          load => app_dial.so
+          load => app_stack.so
+      notify: reload asterisk
+
+    # ============================================
+    # ЗАПУСК СЕРВИСА
+    # ============================================
+    - name: "23 - Enable asterisk service"
+      systemd:
+        name: asterisk
+        enabled: yes
+
+    - name: "24 - Start asterisk service"
+      systemd:
+        name: asterisk
+        state: started
+      register: asterisk_start
+      failed_when: false
+
+    - name: "25 - Wait for asterisk to be ready"
+      wait_for:
+        path: /var/run/asterisk/asterisk.ctl
+        state: present
+        delay: 5
+        timeout: 90
+
+    - name: "26 - Verify asterisk is running"
+      command: asterisk -rx "core show version"
+      register: version_check
+      changed_when: false
+
+    - name: "27 - Show installation result"
+      debug:
+        msg:
+          - "✅ Asterisk is ready!"
+          - "Version: {{ version_check.stdout }}"
+          - "Users configured: {{ pjsip_users | map(attribute='name') | list }}"
+
+  handlers:
+    - name: reload asterisk
+      systemd:
+        name: asterisk
+        state: reloaded
