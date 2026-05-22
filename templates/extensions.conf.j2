@@ -1,0 +1,38 @@
+[from-internal]
+exten => _1XX,1,Dial(PJSIP/${EXTEN})
+exten => _2XX,1,Dial(PJSIP/${EXTEN})
+
+; Входящий вызов на тестовый номер очереди (например, 3000)
+exten => 3000,1,NoOp(--- INCOMING QUEUE CALL from ${CALLERID(num)} ---)
+
+; Сохраняем время поступления звонка в секундах (${EPOCH}) в канальную переменную WAIT_START.
+same => n,Set(WAIT_START=${EPOCH})
+
+; Начинаем бесконечный цикл ожидания. Метка 'wait_loop_start' - точка возврата.
+same => n(loop_start),NoOp(Waiting loop start for ${CALLERID(num)})
+
+; Запускаем MusicOnHold в фоновом режиме, чтобы абонент слышал музыку.
+; Без опции 'a' (abort) выполнение диалплана продолжится.
+same => n,StartMusicOnHold(default)
+
+; Вызываем Python-AGI скрипт, который проверит состояние оператора и сравнит приоритеты.
+; Скрипту передаются: номер дозвона (100), тип устройства (PJSIP) и время начала ожидания.
+same => n,AGI(/var/lib/asterisk/agi-bin/anti_starvation.py,100,PJSIP,${WAIT_START})
+
+; Проверяем переменную, установленную AGI-скриптом (CHANNEL_PRIORITY).
+; Если скрипт вернул переменную с содержимым "ALERT" - пора соединять канал.
+same => n,DumpChan()
+same => n,ExecIf($["${CHANNEL_PRIORITY}" = "ALERT"]?Dial(PJSIP/100,30,tT))
+
+; Если Dial завершился неудачно (по таймауту или оператор занят) или скрипт не дал согласие,
+; останавливаем воспроизведение музыки (поскольку она должна уже играть)...
+same => n,StopMusicOnHold()
+; ...ждем 5 секунд перед повторной проверкой...
+same => n,Wait(5)
+; ...и возвращаемся к началу цикла.
+same => n,Goto(loop_start)
+
+; Если Dial прошел успешно и канал соединен, останавливаем музыку и выходим.
+same => n,StopMusicOnHold()
+same => n,NoOp(--- Call connected successfully ---)
+same => n,Hangup()
