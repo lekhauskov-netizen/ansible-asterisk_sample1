@@ -1,0 +1,1 @@
+# ansible-asterisk_sample1
